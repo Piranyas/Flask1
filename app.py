@@ -11,6 +11,8 @@ from sqlalchemy import String
 from flask_migrate import Migrate
 from sqlalchemy.orm import relationship
 from sqlalchemy import ForeignKey
+import datetime
+from sqlalchemy import func, DateTime
 
 class Base(DeclarativeBase):
     pass
@@ -34,18 +36,22 @@ class AuthorModel(db.Model):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[int] = mapped_column(String(32), index= True, unique=True)
     surname: Mapped[str] = mapped_column(String(50), default='Smit')
+    is_deleted: Mapped[bool] = mapped_column(default=False, nullable=False)
     quotes: Mapped[list['QuoteModel']] = relationship(back_populates='author', lazy='dynamic', cascade="all, delete-orphan")
     
     def __init__(self, name, surname):
         self.name = name
         self.surname = surname
     
-    def to_dict(self):
-        return {
+    def to_dict(self, include_deleted=False):
+        data = {
             "id": self.id,
             "name": self.name,
             "surname": self.surname
         }
+        if include_deleted:
+            data["is_deleted"] = self.is_deleted
+        return data
 
 
 class QuoteModel(db.Model):
@@ -55,6 +61,7 @@ class QuoteModel(db.Model):
     author: Mapped['AuthorModel'] = relationship(back_populates='quotes')
     text: Mapped[str] = mapped_column(String(255))
     rating: Mapped[int] = mapped_column(default=1, nullable=False)
+    created: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
 
     def __init__(self, author, text, rating):
         self.author = author
@@ -65,7 +72,8 @@ class QuoteModel(db.Model):
         return {
             "id": self.id,
             "text": self.text,
-            "rating": self.rating
+            "rating": self.rating,
+            "created": self.created.strftime("%d.%m.%Y") if self.created else None
         }
 
 
@@ -73,13 +81,13 @@ class QuoteModel(db.Model):
 def validate_rating(rating):
     return rating is not None and 1 <= rating <= 5
 
-def convert_authors(authors_db):
+def convert_authors(authors_db, include_deleted=False):
     if isinstance(authors_db, AuthorModel):
-        return authors_db.to_dict()
+        return authors_db.to_dict(include_deleted)
     else:
         authors = []
         for author_db in authors_db:
-            authors.append(author_db.to_dict())
+            authors.append(author_db.to_dict(include_deleted))
         return authors
 
 def convert_quotes(quotes_db):
@@ -106,29 +114,29 @@ def create_author():
 
 @app.route("/authors", methods=["GET"])
 def get_author():
-    author = db.session.query(AuthorModel)
-    authors = convert_authors(author)
-    return authors, 201
+    name_filter = request.args.get('name')
+    surname_filter = request.args.get('surname')
+
+    query = AuthorModel.query.filter_by(is_deleted=False)
+    if name_filter:
+        query = query.filter(AuthorModel.name.ilike(f'%{name_filter}%'))
+    if surname_filter:
+        query = query.filter(AuthorModel.surname.ilike(f'%{surname_filter}%'))
+    authors = query.all()
+    authors_list = convert_authors(authors)
+    return authors_list, 200
 
 @app.route("/authors/<int:id>", methods=["GET"])
 def get_author_by_id(id):
-    author = db.session.get(AuthorModel, id)
+    author = AuthorModel.query.filter_by(id=id, is_deleted=False).first()
     if not author:
         return jsonify(f"Author with id {id} not found"), 404
-    return author.to_dict(), 201
+    return author.to_dict(), 200
 
 @app.route("/quotes", methods=['GET'])
 def show_quotes():
-    #author_filter = request.args.get('author')
-    #rating_filter = request.args.get('rating')
 
-    query = db.session.query(QuoteModel)
-
-    # if author_filter:
-    #     query = query.filter(QuoteModel.author == author_filter)
-    
-    # if rating_filter:
-    #     query = query.filter(QuoteModel.rating == rating_filter)
+    query = QuoteModel.query.join(AuthorModel).filter(AuthorModel.is_deleted == False)
             
     quotes_db = query.all()
     quotes = convert_quotes(quotes_db)
@@ -136,16 +144,21 @@ def show_quotes():
 
 @app.route("/quotes/<int:id>")
 def get_quote(id):
-    quotes_db = get_quote_by_id(id)
-    if not quotes_db:
+    quote = QuoteModel.query.join(AuthorModel).filter(
+        QuoteModel.id == id,
+        AuthorModel.is_deleted == False
+    ).first()
+    
+    if not quote:
         return jsonify(f"Quote with id {id} not found"), 404
 
-    quote = convert_quotes(quotes_db)
-    return jsonify(quote), 200
+    return jsonify(quote.to_dict()), 200
 
 @app.route("/authors/<int:author_id>/quotes", methods=["POST"])
 def create_quote(author_id: int):
-    author = db.session.get(AuthorModel, author_id)
+    author = AuthorModel.query.filter_by(id=author_id, is_deleted=False).first()
+    if not author:
+        return jsonify(f"Author with id {author_id} not found"), 404
     new_quote = request.json
     if 'rating' in new_quote and validate_rating(new_quote['rating']):
         rating = new_quote['rating']
@@ -158,10 +171,14 @@ def create_quote(author_id: int):
 
 @app.route("/authors/<int:author_id>/quotes", methods=["GET"])
 def get_author_quotes(author_id: int):
-    author = db.session.get(AuthorModel, author_id)  
+    author = AuthorModel.query.filter_by(id=author_id, is_deleted=False).first()
     if not author:
-        return jsonify(f"Author with id {id} not found"), 404
-    return jsonify(author.to_dict(), convert_quotes(author.quotes)), 201
+        return jsonify(f"Author with id {author_id} not found"), 404
+    quotes = convert_quotes(author.quotes.all())
+    return jsonify({
+        "author": author.to_dict(),
+        "quotes": quotes
+    }), 200
 
 @app.route("/quotes/<int:id>", methods=['PUT'])
 def edit_quote(id):    
@@ -194,16 +211,60 @@ def delete_quote(id):
     db.session.commit()
     return f"Quote with id {id} deleted.", 200
 
+# Эндпоинты для работы с удаленными авторами
+@app.route("/authors/deleted", methods=["GET"])
+def get_deleted_authors():
+    deleted_authors = AuthorModel.query.filter_by(is_deleted=True).all()
+    authors_list = convert_authors(deleted_authors, include_deleted=True)
+    return jsonify(authors_list), 200
+
+@app.route("/authors/<int:id>/restore", methods=["PATCH"])
+def restore_author(id):
+    author = AuthorModel.query.filter_by(id=id, is_deleted=True).first()
+    if not author:
+        return jsonify(f"Deleted author with id {id} not found"), 404
+    
+    author.is_deleted = False
+    db.session.commit()
+    return author.to_dict(include_deleted=True), 200
+
 @app.route("/authors/<int:id>", methods=['DELETE'])
 def delete_author(id):
-    a = db.session.get(AuthorModel, id)
-    
+    a = AuthorModel.query.filter_by(id=id, is_deleted=False).first()
     if not a:
-        return "No rows to delete", 400 
+        return jsonify(f"Author with id {id} not found or already deleted"), 404
 
-    db.session.delete(a)
+    a.is_deleted = True
     db.session.commit()
-    return f"Author with id {id} deleted.", 200
+    return jsonify({
+        "message": f"Author with id {id} marked as deleted",
+        "author": a.to_dict(include_deleted=True)
+    }), 200
+##################################################
+
+@app.route("/quotes/<int:id>/upvote", methods=['PATCH'])
+def upvote_quote(id):
+    quote = db.session.get(QuoteModel, id)
+    if not quote:
+        return jsonify(f"Quote with id {id} not found"), 404
+
+    if quote.rating < 5:
+        quote.rating += 1
+        db.session.commit()
+    
+    return convert_quotes(quote), 200
+
+@app.route("/quotes/<int:id>/downvote", methods=['PATCH'])
+def downvote_quote(id):
+    quote = db.session.get(QuoteModel, id)
+    if not quote:
+        return jsonify(f"Quote with id {id} not found"), 404
+
+    if quote.rating > 1:
+        quote.rating -= 1
+        db.session.commit()
+    
+    return convert_quotes(quote), 200
 
 if __name__ == "__main__":
     app.run(debug=True)
