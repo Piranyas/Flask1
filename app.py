@@ -4,58 +4,81 @@ from flask import request
 import sqlite3
 from pathlib import Path
 
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import String
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+
 BASE_DIR = Path(__file__).parent
 path_to_db = BASE_DIR / "store.db" # <- тут путь к БД
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
+app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{BASE_DIR / 'main.db'}"
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(model_class=Base)
+db.init_app(app)
+
+class QuoteModel(db.Model):
+    tablename__ = 'quotes'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    author: Mapped[str] = mapped_column(String(32))
+    text: Mapped[str] = mapped_column(String(255))
+    rating: Mapped[int] = mapped_column(default=1)
+
+    def __init__(self, author, text, rating):
+        self.author = author
+        self.text = text
+        self.rating = rating
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "author": self.author,
+            "text": self.text,
+            "rating": self.rating
+        }
 
 
-def next_id(quotes_list):
-    if not quotes_list: 
-        return 1
-    return quotes_list[-1]["id"] + 1
 
 def validate_rating(rating):
     return rating is not None and 1 <= rating <= 5
 
-def find_quote_by_id(quotes_list, target_id):
-    for quote in quotes_list:
-        if quote["id"] == target_id:
-            return quote
-    return None
-
 def convert_quotes(quotes_db):
-    keys = ("id", "author", "text")
-    if isinstance(quotes_db, tuple):
-        return dict(zip(keys, quotes_db))
+    if isinstance(quotes_db, QuoteModel):
+        return quotes_db.to_dict()
     else:
         quotes = []
         for quote_db in quotes_db:
-            quote = dict(zip(keys, quote_db))
-            quotes.append(quote)
+            quotes.append(quote_db.to_dict())
         return quotes
 
 def get_quote_by_id(id):
-    select_quote = "SELECT * from quotes WHERE id=?"
-    connection = sqlite3.connect("store.db")
-    cursor = connection.cursor()
-    cursor.execute(select_quote, (id,))
-    quotes_db = cursor.fetchone()
-    cursor.close()
-    connection.close()
+    quotes_db = db.session.get(QuoteModel, id)
     return quotes_db
 
 
 @app.route("/quotes", methods=['GET'])
 def show_quotes():
-    select_quotes = "SELECT * from quotes"
-    connection = sqlite3.connect("store.db")
-    cursor = connection.cursor()
-    cursor.execute(select_quotes)
-    quotes_db = cursor.fetchall()
-    cursor.close()
-    connection.close()
+    author_filter = request.args.get('author')
+    rating_filter = request.args.get('rating')
+
+    query = db.session.query(QuoteModel)
+
+    if author_filter:
+        query = query.filter(QuoteModel.author == author_filter)
+    
+    if rating_filter:
+        query = query.filter(QuoteModel.rating == rating_filter)
+            
+    quotes_db = query.all()
     quotes = convert_quotes(quotes_db)
     return jsonify(quotes), 200
 
@@ -83,24 +106,19 @@ def create_quote():
     if not data or 'author' not in data or 'text' not in data:
         return "No valid data", 400
     
-    # if 'rating' in data and validate_rating(data['rating']):
-    #     rating = data['rating']
-    # else:
-    #     rating = 1
-    
-    # new_id = next_id(quotes)
+    if 'rating' in data and validate_rating(data['rating']):
+        rating = data['rating']
+    else:
+        rating = 1
 
-    insert_quote = "INSERT INTO quotes (author, text) VALUES (?, ?);"
-    connection = sqlite3.connect("store.db")
-    cursor = connection.cursor()
-    cursor.execute(insert_quote, (data['author'], data['text']))
-    connection.commit()
-    id_last = cursor.lastrowid
-    cursor.close()
-    connection.close()
-    if not id_last:
+    q = QuoteModel(data['author'], data['text'], rating)
+
+    db.session.add(q)
+    db.session.commit()
+
+    if not q.id:
         return "No row created", 400   
-    quotes_db = get_quote_by_id(id_last) 
+    quotes_db = get_quote_by_id(q.id) 
     quote = convert_quotes(quotes_db)
     return jsonify(quote), 201
 
@@ -110,49 +128,33 @@ def edit_quote(id):
     if not new_data:
         return "No data", 400
     
-    set_clauses = []
-    values = []
+    q = db.session.get(QuoteModel, id)
     
+    if not q:
+        return "No rows updated", 400 
+
     if 'text' in new_data:
-        set_clauses.append("text = ?")
-        values.append(new_data['text'])
+        q.text = new_data['text']
     
     if 'author' in new_data:
-        set_clauses.append("author = ?")
-        values.append(new_data['author'])
+        q.author = new_data['author']
     
-    set_query = ", ".join(set_clauses)
-    update_quote = f"UPDATE quotes SET {set_query} WHERE id = ?"
-    values.append(id)
-
-    connection = sqlite3.connect("store.db")
-    cursor = connection.cursor()    
-    cursor.execute(update_quote, tuple(values))
-    connection.commit()
-    count = cursor.rowcount
-    cursor.close()
-    connection.close()
-    
-    if count == 0:
-        return "No rows updated", 400   
+    db.session.commit()
+      
     quotes_db = get_quote_by_id(id) 
     quote = convert_quotes(quotes_db)
     return jsonify(quote), 201
 
 @app.route("/quotes/<int:id>", methods=['DELETE'])
 def delete_quote(id):
-    delete_quote = "DELETE from quotes WHERE id=?"
-    connection = sqlite3.connect("store.db")
-    cursor = connection.cursor()    
-    cursor.execute(delete_quote, (id,))
-    connection.commit()
-    count = cursor.rowcount
-    cursor.close()
-    connection.close()
+    q = db.session.get(QuoteModel, id)
     
-    if count == 0:
-        return "No rows deleted", 400
-    return f"Quote with id {id} is deleted.", 200
+    if not q:
+        return "No rows to delete", 400 
+
+    db.session.delete(q)
+    db.session.commit()
+    return f"Quote with id {id} deleted.", 200
 
 if __name__ == "__main__":
     app.run(debug=True)
